@@ -3,30 +3,32 @@ from dataclasses import dataclass
 
 @dataclass
 class SmolmJp4Config:
-    """Configuration for smolm-jp-4 350M model.
+    """Configuration for smolm-jp-4 maximal 8GB model.
 
     Architecture: GDN (GatedDeltaNet) + GQA hybrid, no GR, no MoE.
-    Target: ~350M parameters, trainable on RTX 2070 Super (8GB).
+    Tuned to maximally utilize RTX 2070 Super (8GB) with gradient checkpointing.
+    624M params, 7.1GB peak at seq=2048 with AdamW (bf16).
 
     NOTE: vocab_size=196,608 (LLM-jp-4 tokenizer) is fixed and dominates the
-    parameter budget (~201M for embedding alone). This limits how small the
-    transformer body can be while still hitting ~350M total.
+    parameter budget (~252M for embedding alone).
+    Sweep result: absolute max is 1408/24/2112 (661M, 7.47GB) but leaves
+    only 0.3GB headroom. This config (1280/28/1920) leaves ~0.7GB margin.
     """
 
     # --- Model size ---
-    hidden_size: int = 1024
-    num_hidden_layers: int = 20
-    intermediate_size: int = 1536
+    hidden_size: int = 1280
+    num_hidden_layers: int = 28
+    intermediate_size: int = 1920
 
     # --- Full-attention (GQA) ---
-    num_attention_heads: int = 8
+    num_attention_heads: int = 10
     num_key_value_heads: int = 2
     head_dim: int = 128  # hidden_size // num_attention_heads
 
     # --- GDN (GatedDeltaNet) ---
     gdn_head_dim: int = 128
-    gdn_num_heads: int = 8
-    gdn_num_v_heads: int = 8
+    gdn_num_heads: int = 10
+    gdn_num_v_heads: int = 10
     gdn_expand_v: float = 1.0
     gdn_use_gate: bool = False
     gdn_conv_size: int = 4
