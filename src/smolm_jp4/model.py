@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from smolm_jp4.config import SmolmJp4Config
 from smolm_jp4.layers.gdn import GDNLayer
@@ -29,6 +30,8 @@ class SmolmJp4Model(nn.Module):
             precompute_freqs_cis(config.head_dim, config.max_position_embeddings, config.rope_theta),
             persistent=False,
         )
+
+        self.gradient_checkpointing = False
 
         self._init_weights()
 
@@ -59,25 +62,37 @@ class SmolmJp4Model(nn.Module):
         all_caches = [] if use_cache else None
 
         for layer in self.layers:
-            if use_cache:
-                past = past_key_values[layer.layer_idx] if past_key_values else None
+            if self.gradient_checkpointing and self.training:
+                hidden_states = checkpoint(
+                    layer,
+                    hidden_states,
+                    freqs_cis,
+                    attention_mask,
+                    None,  # past_key_values
+                    False,  # use_cache
+                    False,  # output_attentions
+                    use_reentrant=False,
+                )[0]
             else:
-                past = None
+                if use_cache:
+                    past = past_key_values[layer.layer_idx] if past_key_values else None
+                else:
+                    past = None
 
-            hidden_states, attn_weights, new_cache = layer(
-                hidden_states,
-                freqs_cis=freqs_cis,
-                attention_mask=attention_mask,
-                past_key_values=past,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                **kwargs,
-            )
+                hidden_states, attn_weights, new_cache = layer(
+                    hidden_states,
+                    freqs_cis=freqs_cis,
+                    attention_mask=attention_mask,
+                    past_key_values=past,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    **kwargs,
+                )
 
-            if output_attentions:
-                all_attn_weights.append(attn_weights)
-            if use_cache:
-                all_caches.append(new_cache)
+                if output_attentions:
+                    all_attn_weights.append(attn_weights)
+                if use_cache:
+                    all_caches.append(new_cache)
 
         hidden_states = self.norm(hidden_states)
 
