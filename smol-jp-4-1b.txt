@@ -1,0 +1,108 @@
+# smolm-jp-4 (1B target, revised)
+# Dense text-only, GDN(linear-attn) + GQA(full-attn) hybrid.
+# Qwen4Exp / Qwen3.8-Flash-Next inspired, but with n-gram embedding and
+# QSA/DSA sparse-attention indexer intentionally removed for this scale.
+#
+# Rationale (see design discussion):
+# - n-gram embedding table scales as ngram_vocab_size_base * hidden_size and
+#   was tuned for a 125-176B MoE model (~51B params for that table alone).
+#   Naively porting it to a ~1-2B dense model dwarfs the entire parameter
+#   budget, so it is dropped entirely rather than resized.
+# - QSA / DSA (lightning-indexer sparse attention) pays off mainly at very
+#   long context (measured speedups are reported around 1M tokens) and
+#   requires an extra Dense Warm-up training stage to initialize the
+#   indexer. At the target context length (32K-64K, agentic use case) and
+#   this parameter scale, the added training-pipeline complexity is not
+#   worth the marginal compute savings. Revisit if/when scaling to
+#   10B-20B and/or context requirements grow well past 64K.
+# - Gated Residual is kept: it is cheap (a small per-branch gate) and may
+#   help training stability, unlike the two items above.
+# - MTP is kept at 1 extra layer for speculative decoding support.
+
+[model]
+name = smolm-jp-4-1b
+model_type = smolm_jp4_dense
+architectures = SmolmJp4ForCausalLM
+language_model_only = true
+
+[text]
+vocab_size = 196608          # kept identical to llm-jp-4 tokenizer
+hidden_size = 1536
+num_hidden_layers = 28
+num_attention_heads = 24
+num_key_value_heads = 2
+head_dim = 64
+
+[attention]
+# Every 4th layer is standard GQA full attention (7 of 28 layers);
+# the remaining 21 layers are Gated DeltaNet-style linear attention.
+# No indexer / QSA / DSA at this scale.
+full_attention_interval = 4
+linear_conv_kernel_dim = 4
+linear_key_head_dim = 192
+linear_num_key_heads = 8
+linear_value_head_dim = 96
+linear_num_value_heads = 16
+
+[ffn_dense]
+intermediate_size = 3072     # ~2.0x hidden, SwiGLU
+activation = silu
+
+[moe]
+num_experts = 0
+num_experts_per_tok = 0
+router = false
+shared_expert = false
+
+[gating]
+output_gate_type = sigmoid   # Gated Residual, kept (cheap, stability aid)
+
+[rope]
+rope_theta = 10000000
+partial_rotary_factor = 0.25
+
+[training]
+dtype = bfloat16
+initializer_range = 0.02
+rms_norm_eps = 1e-06
+attention_dropout = 0.0
+tie_word_embeddings = true   # required to stay within 1B budget with this vocab
+
+[context]
+max_position_embeddings = 65536   # matches stated 32K-64K target use case
+
+[mtp]
+mtp_num_hidden_layers = 1
+mtp_use_dedicated_embeddings = false
+
+[param_accounting]
+# Rough breakdown at these settings (see design discussion for method):
+#   token embedding (tied):     ~302M  (30.8%)
+#   full-attn layers (7):        ~36M  ( 3.6%)
+#   linear-attn layers (21):    ~228M  (23.2%)
+#   FFN (all 28 layers):        ~396M  (40.4%)
+#   MTP block:                   ~19M  ( 2.0%)
+#   ------------------------------------------
+#   total:                      ~981M  (100%)
+# These are analytical estimates from projection-matrix shapes only
+# (no norms/biases/embedding-table rounding); expect actual count to
+# land within a few percent once the real model code is wired up -
+# re-run exact accounting against the actual implementation before
+# committing to a training run.
+
+[notes]
+# 1) n-gram embedding table removed entirely (see rationale above).
+# 2) QSA / DSA sparse-attention indexer removed entirely for this scale;
+#    revisit at 10B-20B scale and/or if context needs exceed ~64K-128K.
+# 3) Vision encoder remains removed (text-only).
+# 4) Scaling reference (same design ratios, rough estimates only):
+#      hidden=2560, layers=32  -> ~2.8B
+#      hidden=3584, layers=36  -> ~5.8B
+#      hidden=4096, layers=40  -> ~8.2B
+#    A 10B-20B version would likely land around hidden=4096-5000ish,
+#    layers=40-48; that is also the point to re-evaluate DSA.
+# 5) Before training: verify exact param count against the real
+#    implementation (this file's numbers are analytical estimates),
+#    and confirm the Chinchilla-ish token budget (~20-40x params,
+#    i.e. roughly 20B-40B tokens for ~1B params) against the actual
+#    LLM-jp-4 corpus mixture you plan to sample.
