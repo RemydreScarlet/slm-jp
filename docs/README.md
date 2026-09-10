@@ -2,7 +2,7 @@
 
 1Bクラス・日本語エージェント用途の dense 言語モデル。
 
-Qwen3.8-Flash-Next (125B MoE) の GDN+GQA ハイブリッドアーキテクチャを、LLM-jp-4 コーパス・トークナイザで日本語モデルに大幅に缩小移植する。
+先進的なハイブリッドアーキテクチャを、LLM-jp-4 コーパス・トークナイザで日本語モデルに大幅に缩小移植する。
 
 ## プロジェクト目標
 
@@ -50,3 +50,7 @@ print(f'Parameters: {model.num_parameters():,}')
 - [flash-linear-attention](https://github.com/fla-org/flash-linear-attention) (GDN カーネル実装)
 - [LLM-jp Corpus v4.1](https://gitlab.llm-jp.nii.ac.jp/datasets/llm-jp-corpus-v4.1)
 - [LLM-jp-4 Tokenizer](https://github.com/llm-jp/llm-jp-tokenizer)
+
+## めも
+
+Reports from other projectに他の文献もあります
