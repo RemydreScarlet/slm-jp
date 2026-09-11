@@ -114,11 +114,17 @@ class FullAttentionLayer(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """A single transformer block: attention/GDN + FFN with pre-norm residuals."""
+    """A single transformer block: attention/GDN + FFN with pre-norm residuals.
+
+    Supports optional Single-Pass mHC (Multi-Hyper-Connection) for improved
+    training stability and expressiveness.
+    """
 
     def __init__(self, config: SmolmJp4Config, layer_idx: int) -> None:
         super().__init__()
+        self.layer_idx = layer_idx
         self.is_full_attention = config.is_full_attention_layer(layer_idx)
+        self.use_mhc = config.use_mhc
 
         if self.is_full_attention:
             self.attn_or_gdn = FullAttentionLayer(config, layer_idx)
@@ -129,6 +135,11 @@ class TransformerBlock(nn.Module):
         self.ffn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.ffn = SwiGLU(config)
 
+        # Single-Pass mHC (optional)
+        if self.use_mhc:
+            from smolm_jp4.layers.mhc import SinglePassMHCFactor
+            self.mhc = SinglePassMHCFactor(config.hidden_size, config.mhc_num_streams)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -137,8 +148,19 @@ class TransformerBlock(nn.Module):
         past_key_values=None,
         use_cache: bool = False,
         output_attentions: bool = False,
+        prev_mhc_A: torch.Tensor | None = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, None, torch.Tensor | None]:
+        """Forward pass with optional mHC.
+
+        Returns:
+            hidden_states: output hidden states
+            attn_weights: attention weights (if requested)
+            new_cache: KV cache (if requested)
+            mhc_A: mHC mixing coefficients (if mHC enabled)
+        """
+        mhc_A = None
+
         # Attention/GDN sublayer
         if self.is_full_attention:
             hidden_states, attn_weights, new_cache = self.attn_or_gdn(
@@ -165,4 +187,9 @@ class TransformerBlock(nn.Module):
         hidden_states = self.ffn(hidden_states)
         hidden_states = residual + hidden_states
 
-        return hidden_states, attn_weights, new_cache
+        # Apply mHC after FFN (modifies the residual stream for next block)
+        if self.use_mhc:
+            mhc_out, mhc_A = self.mhc(hidden_states, prev_mhc_A)
+            hidden_states = mhc_out
+
+        return hidden_states, attn_weights, new_cache, mhc_A

@@ -10,7 +10,14 @@ from smolm_jp4.layers.gqa import FullAttentionLayer, TransformerBlock, precomput
 
 
 class SmolmJp4Model(nn.Module):
-    """Base transformer model for smolm-jp-4."""
+    """Base transformer model for smolm-jp-4.
+
+    Supports:
+    - GDN + GQA hybrid attention
+    - Single-Pass mHC (Multi-Hyper-Connection)
+    - CED (Causal Encoder-Decoder) architecture
+    - CSA2-lite (cross-layer KV sharing for GQA layers)
+    """
 
     def __init__(self, config: SmolmJp4Config) -> None:
         super().__init__()
@@ -32,6 +39,32 @@ class SmolmJp4Model(nn.Module):
         )
 
         self.gradient_checkpointing = False
+
+        # CED: KV projections for decoder layers
+        if config.use_ced:
+            from smolm_jp4.layers.ced import CEDKVProjection
+            self.ced_kv_projections = nn.ModuleList()
+            for i in range(config.num_hidden_layers):
+                if config.is_ced_decoder_layer(i) and config.is_full_attention_layer(i):
+                    # Decoder GQA layers need KV projection from encoder
+                    proj = CEDKVProjection(
+                        hidden_size=config.hidden_size,
+                        num_kv_heads=config.num_key_value_heads,
+                        head_dim=config.head_dim,
+                    )
+                    self.ced_kv_projections.append(proj)
+                else:
+                    self.ced_kv_projections.append(None)
+
+        # CSA2-lite: shared KV cache for GQA layers
+        if config.use_csa2_lite:
+            # Track which GQA layers share KV
+            self._csa2_primary_layer = None
+            for i in range(config.num_hidden_layers):
+                if config.is_full_attention_layer(i):
+                    self._csa2_primary_layer = i
+                    break
+            self._csa2_shared_kv = None
 
         self._init_weights()
 
@@ -61,38 +94,72 @@ class SmolmJp4Model(nn.Module):
         all_attn_weights = []
         all_caches = [] if use_cache else None
 
-        for layer in self.layers:
+        # mHC state tracking
+        prev_mhc_A = None
+        encoder_hidden = None  # For CED
+
+        # CSA2-lite state
+        csa2_shared_kv = None
+
+        for layer_idx, layer in enumerate(self.layers):
+            # CED: store encoder hidden state
+            if self.config.use_ced and self.config.is_ced_encoder_layer(layer_idx):
+                encoder_hidden = hidden_states
+                # For the last encoder layer, also use it for CED decoder KV
+                if self.config.is_ced_encoder_layer(layer_idx):
+                    # Store for potential use by decoder
+                    pass
+
+            # CSA2-lite: check if we should use shared KV
+            layer_past = None
+            if use_cache and self.config.use_csa2_lite:
+                if past_key_values:
+                    layer_past = past_key_values[layer_idx]
+                # For non-primary GQA layers, use shared KV
+                if (self.config.is_full_attention_layer(layer_idx) and
+                    layer_idx != self._csa2_primary_layer and
+                    csa2_shared_kv is not None):
+                    layer_past = csa2_shared_kv
+
             if self.gradient_checkpointing and self.training:
-                hidden_states = checkpoint(
+                result = checkpoint(
                     layer,
                     hidden_states,
                     freqs_cis,
                     attention_mask,
-                    None,  # past_key_values
+                    layer_past,
                     False,  # use_cache
                     False,  # output_attentions
+                    prev_mhc_A,
                     use_reentrant=False,
-                )[0]
+                )
+                hidden_states, attn_weights, new_cache, mhc_A = result
             else:
-                if use_cache:
-                    past = past_key_values[layer.layer_idx] if past_key_values else None
-                else:
-                    past = None
-
-                hidden_states, attn_weights, new_cache = layer(
+                hidden_states, attn_weights, new_cache, mhc_A = layer(
                     hidden_states,
                     freqs_cis=freqs_cis,
                     attention_mask=attention_mask,
-                    past_key_values=past,
+                    past_key_values=layer_past,
                     use_cache=use_cache,
                     output_attentions=output_attentions,
+                    prev_mhc_A=prev_mhc_A,
                     **kwargs,
                 )
 
-                if output_attentions:
-                    all_attn_weights.append(attn_weights)
-                if use_cache:
-                    all_caches.append(new_cache)
+            # Update mHC state
+            prev_mhc_A = mhc_A
+
+            # CSA2-lite: update shared KV from primary layer
+            if (self.config.use_csa2_lite and
+                self.config.is_full_attention_layer(layer_idx) and
+                layer_idx == self._csa2_primary_layer and
+                new_cache is not None):
+                csa2_shared_kv = new_cache
+
+            if output_attentions:
+                all_attn_weights.append(attn_weights)
+            if use_cache:
+                all_caches.append(new_cache)
 
         hidden_states = self.norm(hidden_states)
 

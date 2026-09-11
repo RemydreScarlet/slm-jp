@@ -11,15 +11,18 @@ smolm-jp-4 のアーキテクチャ詳細。Qwen3.8-Flash-Next の主要アイ�
 | GDN (Gated DeltaNet) + 通常 GQA ハイブリッド | **採用** | 論文 Tab.1 で GDN hybrid が 9 ベンチマーク中 8 で改善。4 層に 1 回が GQA、残り 3/4 が GDN |
 | RoPE | **採用** (full-attention 層のみ) | NoPE variant は事後学習後の生成品質に悪影響 (無限生成しやすくなる) |
 | MTP (Multi-Token Prediction) | **採用** (1層追加) | スペキュラティブデコーディング対応 |
-| Gated Residual | **段階的導入** (保留) | §3.1 参照 |
+| **Single-Pass mHC** | **採用** | DeepSeek-V4.1: 残差ストリームを n=4 本に拡張。学習安定性+3.75pt改善 (Qwen3.8 Tab.5) |
+| **CED (Causal Encoder-Decoder)** | **採用** | DeepSeek-V4.1: prefill 計算を約半分に削減。品質は据え置き |
+| **CSA2-lite** | **採用** | DeepSeek-V4.1: GQA層間で KV キャッシュを共有 |
 
 ### 削除したコンポーネント
 
 | コンポーネント | 判断 | 理由 |
 |---|---|---|
-| n-gram embedding table | **削除** | 125B MoE では「300 tokens per active parameter」で管理される巨大記憶装置。1B dense ではテーブルだけで本体を上回り、パラメータ予算が破綻 |
-| QSA / DSA (Sparse Attention) | **見送り** | 効果は主に 512K〜1M 長文脈で顕在化。32K〜64K ではメリット薄く、indexer 学習に Dense Warm-up ステージの追加コストに見合わない |
+| n-gram embedding table (Engram) | **見送り** | 1B ではパラメータ予算が厳しい (128M追加で埋め込み比率が44%に)。10B移行時に再検討 |
+| QSA / DSA (Sparse Attention) | **見送り** | 効果は主に 512K〜1M 長文脈で顕在化。32K〜64K ではメリット薄く |
 | MoE (ルーティング、複数エキスパート) | **削除 (dense 化)** | 当初の config.txt 自体が dense 化を明言 |
+| Gated Residual (GR) | **mHC で代替** | Single-Pass mHC が GR の機能をカバー。+3.75pt 改善実績あり |
 
 ## パラメータ配分
 
@@ -144,17 +147,64 @@ hidden=4096, layers=40  -> ~8.2B
 
 10B〜20B 帯は hidden=4096〜5000 台、layers=40〜48 あたりが目安。**この規模になった時点で QSA/DSA 導入と Muon optimizer の本格採用を再検討する。**
 
-## Gated Residual (GR) の段階的導入方針
+## DeepSeek-V4.1 由来の新機能
 
-論文の GR は、残差ストリームを nr=4 本に拡張し、read/write/GatedNorm を各層に挿入する機構。
+### Single-Pass mHC (Multi-Hyper-Connection)
 
-| ステップ | 内容 | 目的 |
+**目的**: 残差ストリームを n=4 本に拡張し、学習安定性と表現力向上
+
+**仕組み**:
+```
+X^{l+1} = B_l X^l + C_l F_l(A_{l-1} X^l)
+(A_l, B_l, C_l) = H(X^l)
+```
+
+- A_l: (batch, seq, 4) - 入力混合係数（1ブロック遅延）
+- B_l: (batch, seq, 4, 4) - ストリーム間混合
+- C_l: (batch, seq, 4) - 出力混合
+- GatedNorm: 要素ごとセルフゲート
+
+**パラメータ追加**: ~57M (8.8%)
+**効果**: Qwen3.8 で +3.75pt 平均スコア改善
+
+### CED (Causal Encoder-Decoder)
+
+**目的**: prefill 計算量を約半分に削減
+
+**仕組み**:
+- 28層を 14:14 に分割
+- エンコーダ (層0-13): 通常のトランスフォーマー計算
+- デコーダ (層14-27): グローバルKVをエンコーダ最終隠れ状態から射影
+  - C_l = H_{L/2} W_KV^l
+  - Z_l = H_{L/2} W_Z^l
+
+**パラメータ追加**: ~32M (4.9%)
+**利点**: エージェント用途（頻繁なツール呼び出し）でprefillコスト削減
+
+### CSA2-lite (Cross-Layer KV Sharing)
+
+**目的**: GQA層間でKVキャッシュを共有
+
+**仕組み**:
+- 7層のGQA層でKVを共有（層0がPrimary、残り6層がReuse）
+- メモリ効率向上
+
+**パラメータ追加**: なし
+**制限**: GDN層には適用不可
+
+## Gated Residual (GR) の扱い
+
+**結論**: Single-Pass mHC で代替
+
+GR は 1B スケールでは activation メモリ 4 倍増がボトルネックになる可能性があったが、
+Single-Pass mHC は同等の改善効果（+3.75pt）をより効率的に実現する。
+
+| 比較項目 | GR (nr=4) | Single-Pass mHC |
 |---|---|---|
-| 1 | GR なし・AdamW でベースライン学習 | パイプライン動作確認 |
-| 2 | GatedNorm のみ追加 (残差拡張なし) | 安定性への効果を実測 |
-| 3 | nr=4 のフル GR へ拡張 | 不安定性が問題になる場合のみ |
-
-> ステップ 1 のベースライン学習が回った時点で、ステップ 2 の効果を実測して判断する。
+| パラメータ追加 | +134M | +57M |
+| アクティベーション増 | 4倍 | 4倍 (Mega-mHC で2倍に削減可) |
+| 実装の複雑さ | 高 | 中 |
+| 安定性効果 | 大 | 大 |
 
 ---
 

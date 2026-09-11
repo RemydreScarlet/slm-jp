@@ -1,18 +1,18 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
 class SmolmJp4Config:
-    """Configuration for smolm-jp-4 maximal 8GB model.
+    """Configuration for smolm-jp-4 model.
 
-    Architecture: GDN (GatedDeltaNet) + GQA hybrid, no GR, no MoE.
-    Tuned to maximally utilize RTX 2070 Super (8GB) with gradient checkpointing.
-    624M params, 7.1GB peak at seq=2048 with AdamW (bf16).
+    Architecture: GDN (GatedDeltaNet) + GQA hybrid, with Single-Pass mHC,
+    CED (Causal Encoder-Decoder), and CSA2-lite (cross-layer KV sharing).
+    Dense model, no MoE.
 
-    NOTE: vocab_size=196,608 (LLM-jp-4 tokenizer) is fixed and dominates the
-    parameter budget (~252M for embedding alone).
-    Sweep result: absolute max is 1408/24/2112 (661M, 7.47GB) but leaves
-    only 0.3GB headroom. This config (1280/28/1920) leaves ~0.7GB margin.
+    Key innovations from DeepSeek-V4.1:
+    - Single-Pass mHC: Multi-stream residual connections for stability
+    - CED: Split encoder/decoder to halve prefill computation
+    - CSA2-lite: Cross-layer KV sharing for GQA layers
     """
 
     # --- Model size ---
@@ -53,6 +53,24 @@ class SmolmJp4Config:
     # --- RoPE ---
     rope_theta: float = 10_000.0
 
+    # --- Single-Pass mHC (Multi-Hyper-Connection) ---
+    # From DeepSeek-V4.1: maintains n residual streams between blocks
+    # Improves training stability and expressiveness
+    use_mhc: bool = True
+    mhc_num_streams: int = 4  # n=4 residual streams
+
+    # --- CED (Causal Encoder-Decoder) ---
+    # From DeepSeek-V4.1: split layers into encoder/decoder
+    # Decoder KV is projected from encoder's final hidden state
+    # Reduces prefill computation by ~50%
+    use_ced: bool = True
+    ced_split_ratio: float = 0.5  # fraction of layers used as encoder
+
+    # --- CSA2-lite (Cross-Layer KV Sharing) ---
+    # From DeepSeek-V4.1: share KV across GQA layers
+    # Only applies to full-attention (GQA) layers
+    use_csa2_lite: bool = True
+
     @property
     def num_gdn_layers(self) -> int:
         return self.num_hidden_layers - self.num_full_attn_layers
@@ -66,6 +84,19 @@ class SmolmJp4Config:
 
     def is_full_attention_layer(self, layer_idx: int) -> bool:
         return layer_idx % self.full_attention_interval == self.full_attention_interval - 1
+
+    @property
+    def ced_split_point(self) -> int:
+        """Layer index where encoder ends and decoder begins."""
+        return int(self.num_hidden_layers * self.ced_split_ratio)
+
+    def is_ced_encoder_layer(self, layer_idx: int) -> bool:
+        """True if this layer is in the encoder portion of CED."""
+        return layer_idx < self.ced_split_point
+
+    def is_ced_decoder_layer(self, layer_idx: int) -> bool:
+        """True if this layer is in the decoder portion of CED."""
+        return layer_idx >= self.ced_split_point
 
     def __post_init__(self):
         assert self.hidden_size % self.num_attention_heads == 0
